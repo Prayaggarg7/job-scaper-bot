@@ -1,0 +1,45 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Job Dashboard</title>
+<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+<style>
+body { margin: 20px; }
+table { background: white; }
+h1 { text-align: center; margin-bottom: 20px; }
+</style>
+</head>
+<body>
+<div class="container">
+<h1>🧠 Job Scraper Dashboard</h1>
+<input type="text" id="filterInput" class="form-control mb-3" placeholder="Filter by title/company/portal..." onkeyup="filterTable()">
+<table class="table table-striped" id="jobTable">
+<thead class="table-dark">
+<tr>
+<th>Title</th><th>Company</th><th>Portal</th><th>Posted Date</th><th>Days Ago</th><th>Apply</th>
+</tr></thead>
+<tbody>
+{% for job in jobs %}
+<tr>
+<td>{{ job.title }}</td>
+<td>{{ job.company }}</td>
+<td>{{ job.portal }}</td>
+<td>{{ job.posted_date }}</td>
+<td>{{ job.days_ago }}</td>
+<td><a href="{{ job.link }}" target="_blank">Apply Now</a></td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+</div>
+<script>
+function filterTable(){
+let input=document.getElementById("filterInput").value.toLowerCase();
+let rows=document.querySelectorAll("#jobTable tbody tr");
+rows.forEach(r=>{r.style.display=r.innerText.toLowerCase().includes(input)?"":"none";});
+}
+</script>
+</body>
+</html>

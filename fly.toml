@@ -1,0 +1,12 @@
+
+app = "job-scraper-bot"
+primary_region = "sin"
+[build]
+  dockerfile = "Dockerfile"
+[env]
+  CHECK_INTERVAL = "300"
+  MAX_DAYS_OLD = "10"
+  TELEGRAM_ENABLED = "false"
+[mounts]
+  source = "jobdata"
+  destination = "/data"
