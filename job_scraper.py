@@ -3,29 +3,47 @@ import time
 import hashlib
 import requests
 from bs4 import BeautifulSoup
-from datetime import datetime, timedelta
+from datetime import datetime
 import sqlite3
 import re
 from urllib.parse import quote_plus
 from flask import Flask, render_template
+from flask_httpauth import HTTPBasicAuth
+from werkzeug.security import generate_password_hash, check_password_hash
+import threading
 
-# Paths for Fly.io persistent volume
+# ----------------------
+# Paths & Logging
+# ----------------------
 DATA_DIR = "/app/data"
 os.makedirs(DATA_DIR, exist_ok=True)
 DB_PATH = os.path.join(DATA_DIR, "jobs.db")
 LOG_PATH = os.path.join(DATA_DIR, "bot.log")
 
-# Logging helper
 def log(msg):
     timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     print(f"[{timestamp}] {msg}")
     with open(LOG_PATH, "a", encoding="utf-8") as f:
         f.write(f"[{timestamp}] {msg}\n")
 
-# Flask app for dashboard
+# ----------------------
+# Flask App & Auth
+# ----------------------
 app = Flask(__name__)
+auth = HTTPBasicAuth()
 
-# Bot class
+USERNAME = os.getenv("DASHBOARD_USER", "admin")
+PASSWORD = os.getenv("DASHBOARD_PASS", "1234")
+users = {USERNAME: generate_password_hash(PASSWORD)}
+
+@auth.verify_password
+def verify_password(username, password):
+    if username in users and check_password_hash(users.get(username), password):
+        return username
+
+# ----------------------
+# Job Scraper Bot
+# ----------------------
 class JobScraperBot:
     def __init__(self):
         self.telegram_bot_token = os.getenv('TELEGRAM_BOT_TOKEN')
@@ -33,10 +51,8 @@ class JobScraperBot:
         self.skills = os.getenv('JOB_SKILLS', 'python,javascript,react').lower().split(',')
         self.check_interval = int(os.getenv('CHECK_INTERVAL', '300'))  # 5 min
         self.max_days_old = int(os.getenv('MAX_DAYS_OLD', '10'))
-        
-        self.headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
-        }
+
+        self.headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
         self.init_database()
 
     def init_database(self):
@@ -189,11 +205,95 @@ class JobScraperBot:
         except Exception as e:
             log(f"❌ RemoteOK error: {e}")
         return jobs
+    
+    # Naukri RSS Scraper
+    def scrape_naukri(self):
+        jobs=[]
+        try:
+            query = '+'.join(self.skills)
+            url = f"https://www.naukri.com/rss/jobfeed?skill={query}&experience=0"
+            r = requests.get(url, headers=self.headers, timeout=15)
+            if r.status_code==200:
+                soup = BeautifulSoup(r.content, 'xml')
+                for item in soup.find_all('item')[:30]:
+                    title = item.find('title').text if item.find('title') else 'N/A'
+                    link = item.find('link').text if item.find('link') else ''
+                    pub = item.find('pubDate').text if item.find('pubDate') else ''
+                    try:
+                        job_date = datetime.strptime(pub, '%a, %d %b %Y %H:%M:%S %Z')
+                        days_ago=(datetime.now()-job_date).days
+                    except:
+                        days_ago=0
+                    if not self.is_recent_job(days_ago):
+                        continue
+                    jobs.append({'id':self.generate_job_id(title,'Naukri',link),
+                                'title':title,'company':'N/A','link':link,
+                                'portal':'Naukri','posted_date':pub,'days_ago':days_ago})
+        except Exception as e:
+            log(f"❌ Naukri error: {e}")
+        return jobs
+
+    # Shine RSS Scraper
+    def scrape_shine(self):
+        jobs=[]
+        try:
+            query = '+'.join(self.skills)
+            url = f"https://www.shine.com/rss/jobs/{query}/"
+            r = requests.get(url, headers=self.headers, timeout=15)
+            if r.status_code==200:
+                soup = BeautifulSoup(r.content, 'xml')
+                for item in soup.find_all('item')[:30]:
+                    title = item.find('title').text if item.find('title') else 'N/A'
+                    link = item.find('link').text if item.find('link') else ''
+                    pub = item.find('pubDate').text if item.find('pubDate') else ''
+                    try:
+                        job_date = datetime.strptime(pub, '%a, %d %b %Y %H:%M:%S %Z')
+                        days_ago=(datetime.now()-job_date).days
+                    except:
+                        days_ago=0
+                    if not self.is_recent_job(days_ago):
+                        continue
+                    jobs.append({'id':self.generate_job_id(title,'Shine',link),
+                                'title':title,'company':'N/A','link':link,
+                                'portal':'Shine','posted_date':pub,'days_ago':days_ago})
+        except Exception as e:
+            log(f"❌ Shine error: {e}")
+        return jobs
+
+    # TimesJobs RSS Scraper
+    def scrape_timesjobs(self):
+        jobs=[]
+        try:
+            query = '+'.join(self.skills)
+            url = f"https://www.timesjobs.com/candidate/job-search.html?searchType=personalizedSearch&from=submit&txtKeywords={query}&txtLocation="
+            r = requests.get(url, headers=self.headers, timeout=15)
+            if r.status_code==200:
+                soup = BeautifulSoup(r.text,'html.parser')
+                postings = soup.find_all('li', class_='clearfix')[:30]
+                for post in postings:
+                    title_tag = post.find('h2')
+                    title = title_tag.text.strip() if title_tag else 'N/A'
+                    link = title_tag.a['href'] if title_tag and title_tag.a else ''
+                    company_tag = post.find('h3', class_='joblist-comp-name')
+                    company = company_tag.text.strip() if company_tag else 'N/A'
+                    days_tag = post.find('span', class_='sim-posted')
+                    days_text = days_tag.text.strip() if days_tag else ''
+                    days_ago = self.parse_days_ago(days_text)
+                    if not self.is_recent_job(days_ago):
+                        continue
+                    jobs.append({'id':self.generate_job_id(title,company,link),
+                                'title':title,'company':company,'link':link,
+                                'portal':'TimesJobs','posted_date':days_text,'days_ago':days_ago})
+        except Exception as e:
+            log(f"❌ TimesJobs error: {e}")
+        return jobs
+
 
     # Combine all portals
     def scrape_all(self):
         all_jobs=[]
-        portals=[self.scrape_remotive,self.scrape_indeed,self.scrape_remoteok]
+        portals=[self.scrape_remotive,self.scrape_indeed,self.scrape_remoteok,
+                self.scrape_naukri,self.scrape_shine,self.scrape_timesjobs]
         for fn in portals:
             try:
                 log(f"🔍 Scraping {fn.__name__}...")
@@ -204,6 +304,7 @@ class JobScraperBot:
                 log(f"   ✗ Error: {e}")
             time.sleep(2)
         return all_jobs
+
 
     # Optional Telegram
     def send_telegram(self, job):
@@ -247,20 +348,26 @@ class JobScraperBot:
 
 bot = JobScraperBot()
 
-# Flask route for dashboard
+# ----------------------
+# Flask route
+# ----------------------
 @app.route("/")
+@auth.login_required
 def dashboard():
-    cursor=bot.conn.cursor()
+    cursor = bot.conn.cursor()
     cursor.execute("SELECT title,company,link,portal,posted_date,days_ago FROM jobs ORDER BY posted_date DESC")
-    rows=cursor.fetchall()
-    jobs=[{'title':r[0],'company':r[1],'link':r[2],'portal':r[3],'posted_date':r[4],'days_ago':r[5]} for r in rows]
-    return render_template("index.html",jobs=jobs)
+    rows = cursor.fetchall()
+    jobs = [{'title': r[0], 'company': r[1], 'link': r[2], 'portal': r[3],
+             'posted_date': r[4], 'days_ago': r[5]} for r in rows]
+    return render_template("index.html", jobs=jobs)
 
-if __name__=="__main__":
-    # Run scraper in a separate thread
-    import threading
-    t=threading.Thread(target=bot.run)
-    t.daemon=True
+# ----------------------
+# Run Flask + Bot in Thread
+# ----------------------
+def start_bot():
+    bot.run()
+
+if __name__ == "__main__":
+    t = threading.Thread(target=start_bot)
     t.start()
-    # Run Flask dashboard
-    app.run(host="0.0.0.0",port=8080)
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT",8080)))

@@ -1,4 +1,6 @@
-
 flask
 requests
 beautifulsoup4
+lxml
+flask-httpauth
+werkzeug
