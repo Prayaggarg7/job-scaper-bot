@@ -7,6 +7,7 @@ COPY . /app
 RUN pip install --upgrade pip
 RUN pip install -r requirements.txt
 
+# Expose port for Render
 ENV PORT 8080
 
 EXPOSE 8080
