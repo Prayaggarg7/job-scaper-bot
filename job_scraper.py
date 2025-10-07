@@ -7,63 +7,38 @@ from datetime import datetime
 import sqlite3
 import re
 from urllib.parse import quote_plus
-from flask import Flask, render_template
-from flask_httpauth import HTTPBasicAuth
-from werkzeug.security import generate_password_hash, check_password_hash
-import threading
+from flask import Flask, render_template, request, Response
 
-# ----------------------
-# Paths & Logging
-# ----------------------
-DATA_DIR = "/app/data"
-os.makedirs(DATA_DIR, exist_ok=True)
-DB_PATH = os.path.join(DATA_DIR, "jobs.db")
-LOG_PATH = os.path.join(DATA_DIR, "bot.log")
-
+# ---------------- Logging helper ----------------
 def log(msg):
     timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    print(f"[{timestamp}] {msg}")
-    with open(LOG_PATH, "a", encoding="utf-8") as f:
-        f.write(f"[{timestamp}] {msg}\n")
+    print(f"[{timestamp}] {msg}", flush=True)
 
-# ----------------------
-# Flask App & Auth
-# ----------------------
-app = Flask(__name__)
-auth = HTTPBasicAuth()
-
-USERNAME = os.getenv("DASHBOARD_USER", "admin")
-PASSWORD = os.getenv("DASHBOARD_PASS", "1234")
-users = {USERNAME: generate_password_hash(PASSWORD)}
-
-@auth.verify_password
-def verify_password(username, password):
-    if username in users and check_password_hash(users.get(username), password):
-        return username
-
-# ----------------------
-# Job Scraper Bot
-# ----------------------
+# ---------------- Bot Class ----------------
 class JobScraperBot:
     def __init__(self):
         self.telegram_bot_token = os.getenv('TELEGRAM_BOT_TOKEN')
         self.telegram_chat_id = os.getenv('TELEGRAM_CHAT_ID')
         self.skills = os.getenv('JOB_SKILLS', 'python,javascript,react').lower().split(',')
-        self.check_interval = int(os.getenv('CHECK_INTERVAL', '300'))  # 5 min
+        self.check_interval = int(os.getenv('CHECK_INTERVAL', '300'))  # default 5 min
         self.max_days_old = int(os.getenv('MAX_DAYS_OLD', '10'))
+        self.dash_user = os.getenv('DASHBOARD_USER', 'admin')
+        self.dash_pass = os.getenv('DASHBOARD_PASS', 'password')
 
-        self.headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+        self.headers = {'User-Agent': 'Mozilla/5.0'}
+
+        # DB setup
         self.init_database()
 
     def init_database(self):
-        self.conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+        self.conn = sqlite3.connect('jobs.db', check_same_thread=False)
         self.cursor = self.conn.cursor()
         self.cursor.execute('''
-            CREATE TABLE IF NOT EXISTS jobs (
+            CREATE TABLE IF NOT EXISTS seen_jobs (
                 job_id TEXT PRIMARY KEY,
                 title TEXT,
                 company TEXT,
-                link TEXT,
+                url TEXT,
                 portal TEXT,
                 posted_date TEXT,
                 days_ago INTEGER,
@@ -72,32 +47,33 @@ class JobScraperBot:
         ''')
         self.conn.commit()
 
-    def generate_job_id(self, title, company, link):
-        return hashlib.md5(f"{title}{company}{link}".encode()).hexdigest()
+    # ---------- Job helpers ----------
+    def generate_job_id(self, title, company, url):
+        return hashlib.md5(f"{title}{company}{url}".encode()).hexdigest()
 
     def is_job_seen(self, job_id):
-        self.cursor.execute('SELECT job_id FROM jobs WHERE job_id = ?', (job_id,))
+        self.cursor.execute('SELECT job_id FROM seen_jobs WHERE job_id=?', (job_id,))
         return self.cursor.fetchone() is not None
 
-    def mark_job_seen(self, job):
+    def mark_job_seen(self, job_id, title, company, url, portal, posted_date, days_ago):
         try:
             self.cursor.execute('''
-                INSERT INTO jobs (job_id,title,company,link,portal,posted_date,days_ago)
+                INSERT INTO seen_jobs (job_id,title,company,url,portal,posted_date,days_ago)
                 VALUES (?,?,?,?,?,?,?)
-            ''', (job['id'], job['title'], job['company'], job['link'], job['portal'], job['posted_date'], job['days_ago']))
+            ''', (job_id, title, company, url, portal, posted_date, days_ago))
             self.conn.commit()
         except sqlite3.IntegrityError:
             pass
 
-    def matches_skills(self, text):
-        text_lower = text.lower()
-        return any(skill.strip() in text_lower for skill in self.skills)
+    def matches_skills(self, job_text):
+        job_text_lower = job_text.lower()
+        return any(skill.strip() in job_text_lower for skill in self.skills)
 
-    def parse_days_ago(self, date_string):
-        if not date_string:
+    def parse_days_ago(self, date_str):
+        if not date_str:
             return 999
-        date_lower = date_string.lower()
-        if any(w in date_lower for w in ['today','just now','minutes ago','hours ago']):
+        date_lower = date_str.lower()
+        if any(w in date_lower for w in ['today','just now','minutes ago','hours ago','hour ago']):
             return 0
         if 'yesterday' in date_lower:
             return 1
@@ -106,60 +82,67 @@ class JobScraperBot:
             return int(days_match.group(1))
         weeks_match = re.search(r'(\d+)\s*week', date_lower)
         if weeks_match:
-            return int(weeks_match.group(1))*7
+            return int(weeks_match.group(1)) * 7
         months_match = re.search(r'(\d+)\s*month', date_lower)
         if months_match:
-            return int(months_match.group(1))*30
+            return int(months_match.group(1)) * 30
         return 999
 
     def is_recent_job(self, days_ago):
         return days_ago <= self.max_days_old
 
-    # ---- Scrapers ----
+    # ---------- Scrapers ----------
     def scrape_remotive(self):
-        jobs=[]
+        jobs = []
+        url = "https://remotive.com/api/remote-jobs?limit=50"
+        log("🔍 Scraping Remotive jobs...")
         try:
-            url="https://remotive.com/api/remote-jobs?limit=50"
-            r=requests.get(url,headers=self.headers,timeout=15)
-            if r.status_code==200:
-                data=r.json()
-                for j in data.get('jobs',[]):
-                    pub_date=j.get('publication_date','')
+            r = requests.get(url, headers=self.headers, timeout=15)
+            log(f"HTTP Status: {r.status_code}")
+            if r.status_code == 200:
+                data = r.json()
+                for job in data.get('jobs', []):
+                    pub_date = job.get('publication_date','')
                     try:
-                        job_date=datetime.strptime(pub_date,'%Y-%m-%dT%H:%M:%S')
-                        days_ago=(datetime.now()-job_date).days
+                        job_date = datetime.strptime(pub_date, '%Y-%m-%dT%H:%M:%S')
+                        days_ago = (datetime.now() - job_date).days
                     except:
-                        days_ago=999
+                        days_ago = 999
                     if not self.is_recent_job(days_ago):
                         continue
-                    text=f"{j.get('title','')} {j.get('description','')} {' '.join(j.get('tags',[]))}"
-                    if self.matches_skills(text):
-                        jobs.append({'id':self.generate_job_id(j.get('title',''),j.get('company_name',''),j.get('url','')),
-                                     'title':j.get('title','N/A'),
-                                     'company':j.get('company_name','N/A'),
-                                     'link':j.get('url',''),
-                                     'portal':'Remotive',
-                                     'posted_date':pub_date,
-                                     'days_ago':days_ago})
+                    job_text = f"{job.get('title','')} {job.get('description','')} {' '.join(job.get('tags',[]))}"
+                    if self.matches_skills(job_text):
+                        jobs.append({
+                            'title': job.get('title','N/A'),
+                            'company': job.get('company_name','N/A'),
+                            'link': job.get('url',''),
+                            'portal': 'Remotive',
+                            'posted_date': pub_date,
+                            'days_ago': days_ago
+                        })
+            log(f"✅ Found {len(jobs)} jobs on Remotive")
         except Exception as e:
-            log(f"❌ Remotive error: {e}")
+            log(f"❌ Remotive scrape error: {e}")
         return jobs
 
     def scrape_indeed(self):
         jobs=[]
+        query=' OR '.join(self.skills[:3])
+        url=f"https://www.indeed.com/rss?q={quote_plus(query)}&fromage=10"
+        log("🔍 Scraping Indeed RSS jobs...")
         try:
-            query=' OR '.join(self.skills[:3])
-            url=f"https://www.indeed.com/rss?q={quote_plus(query)}&fromage={self.max_days_old}"
-            r=requests.get(url,headers=self.headers,timeout=15)
+            r = requests.get(url, headers=self.headers, timeout=15)
+            log(f"HTTP Status: {r.status_code}")
             if r.status_code==200:
                 soup=BeautifulSoup(r.content,'xml')
-                for item in soup.find_all('item')[:30]:
+                items=soup.find_all('item')[:30]
+                for item in items:
                     title=item.find('title').text if item.find('title') else 'N/A'
                     link=item.find('link').text if item.find('link') else ''
                     desc=item.find('description').text if item.find('description') else ''
-                    pub=item.find('pubDate').text if item.find('pubDate') else ''
+                    pub_date=item.find('pubDate').text if item.find('pubDate') else ''
                     try:
-                        job_date=datetime.strptime(pub,'%a, %d %b %Y %H:%M:%S %Z')
+                        job_date=datetime.strptime(pub_date,'%a, %d %b %Y %H:%M:%S %Z')
                         days_ago=(datetime.now()-job_date).days
                     except:
                         days_ago=0
@@ -170,204 +153,77 @@ class JobScraperBot:
                         parts=title.split(' - ')
                         if len(parts)>1:
                             company=parts[-1]
-                    text=f"{title} {desc}"
-                    if self.matches_skills(text):
-                        jobs.append({'id':self.generate_job_id(title,company,link),
-                                     'title':title,'company':company,'link':link,'portal':'Indeed',
-                                     'posted_date':pub,'days_ago':days_ago})
+                    job_text=f"{title} {desc}"
+                    if self.matches_skills(job_text):
+                        jobs.append({
+                            'title': title,
+                            'company': company,
+                            'link': link,
+                            'portal': 'Indeed',
+                            'posted_date': pub_date,
+                            'days_ago': days_ago
+                        })
+            log(f"✅ Found {len(jobs)} jobs on Indeed")
         except Exception as e:
-            log(f"❌ Indeed error: {e}")
+            log(f"❌ Indeed scrape error: {e}")
         return jobs
 
-    def scrape_remoteok(self):
-        jobs=[]
-        try:
-            url="https://remoteok.com/api"
-            r=requests.get(url,headers=self.headers,timeout=15)
-            if r.status_code==200:
-                data=r.json()
-                for j in data[1:31]:
-                    if not isinstance(j,dict):
-                        continue
-                    epoch=j.get('epoch',0)
-                    if epoch:
-                        job_date=datetime.fromtimestamp(epoch)
-                        days_ago=(datetime.now()-job_date).days
-                    else:
-                        days_ago=0
-                    if not self.is_recent_job(days_ago):
-                        continue
-                    text=f"{j.get('position','')} {j.get('description','')} {' '.join(j.get('tags',[]))}"
-                    if self.matches_skills(text):
-                        jobs.append({'id':self.generate_job_id(j.get('position',''),j.get('company',''),j.get('url','')),
-                                     'title':j.get('position','N/A'),'company':j.get('company','N/A'),
-                                     'link':j.get('url',''),'portal':'RemoteOK','posted_date':j.get('date','N/A'),'days_ago':days_ago})
-        except Exception as e:
-            log(f"❌ RemoteOK error: {e}")
-        return jobs
-    
-    # Naukri RSS Scraper
-    def scrape_naukri(self):
-        jobs=[]
-        try:
-            query = '+'.join(self.skills)
-            url = f"https://www.naukri.com/rss/jobfeed?skill={query}&experience=0"
-            r = requests.get(url, headers=self.headers, timeout=15)
-            if r.status_code==200:
-                soup = BeautifulSoup(r.content, 'xml')
-                for item in soup.find_all('item')[:30]:
-                    title = item.find('title').text if item.find('title') else 'N/A'
-                    link = item.find('link').text if item.find('link') else ''
-                    pub = item.find('pubDate').text if item.find('pubDate') else ''
-                    try:
-                        job_date = datetime.strptime(pub, '%a, %d %b %Y %H:%M:%S %Z')
-                        days_ago=(datetime.now()-job_date).days
-                    except:
-                        days_ago=0
-                    if not self.is_recent_job(days_ago):
-                        continue
-                    jobs.append({'id':self.generate_job_id(title,'Naukri',link),
-                                'title':title,'company':'N/A','link':link,
-                                'portal':'Naukri','posted_date':pub,'days_ago':days_ago})
-        except Exception as e:
-            log(f"❌ Naukri error: {e}")
-        return jobs
+    # You can add more portal scrapers here (RemoteOK, Naukri, Shine, TimesJobs, Glassdoor)
 
-    # Shine RSS Scraper
-    def scrape_shine(self):
-        jobs=[]
-        try:
-            query = '+'.join(self.skills)
-            url = f"https://www.shine.com/rss/jobs/{query}/"
-            r = requests.get(url, headers=self.headers, timeout=15)
-            if r.status_code==200:
-                soup = BeautifulSoup(r.content, 'xml')
-                for item in soup.find_all('item')[:30]:
-                    title = item.find('title').text if item.find('title') else 'N/A'
-                    link = item.find('link').text if item.find('link') else ''
-                    pub = item.find('pubDate').text if item.find('pubDate') else ''
-                    try:
-                        job_date = datetime.strptime(pub, '%a, %d %b %Y %H:%M:%S %Z')
-                        days_ago=(datetime.now()-job_date).days
-                    except:
-                        days_ago=0
-                    if not self.is_recent_job(days_ago):
-                        continue
-                    jobs.append({'id':self.generate_job_id(title,'Shine',link),
-                                'title':title,'company':'N/A','link':link,
-                                'portal':'Shine','posted_date':pub,'days_ago':days_ago})
-        except Exception as e:
-            log(f"❌ Shine error: {e}")
-        return jobs
-
-    # TimesJobs RSS Scraper
-    def scrape_timesjobs(self):
-        jobs=[]
-        try:
-            query = '+'.join(self.skills)
-            url = f"https://www.timesjobs.com/candidate/job-search.html?searchType=personalizedSearch&from=submit&txtKeywords={query}&txtLocation="
-            r = requests.get(url, headers=self.headers, timeout=15)
-            if r.status_code==200:
-                soup = BeautifulSoup(r.text,'html.parser')
-                postings = soup.find_all('li', class_='clearfix')[:30]
-                for post in postings:
-                    title_tag = post.find('h2')
-                    title = title_tag.text.strip() if title_tag else 'N/A'
-                    link = title_tag.a['href'] if title_tag and title_tag.a else ''
-                    company_tag = post.find('h3', class_='joblist-comp-name')
-                    company = company_tag.text.strip() if company_tag else 'N/A'
-                    days_tag = post.find('span', class_='sim-posted')
-                    days_text = days_tag.text.strip() if days_tag else ''
-                    days_ago = self.parse_days_ago(days_text)
-                    if not self.is_recent_job(days_ago):
-                        continue
-                    jobs.append({'id':self.generate_job_id(title,company,link),
-                                'title':title,'company':company,'link':link,
-                                'portal':'TimesJobs','posted_date':days_text,'days_ago':days_ago})
-        except Exception as e:
-            log(f"❌ TimesJobs error: {e}")
-        return jobs
-
-
-    # Combine all portals
-    def scrape_all(self):
+    def scrape_all_portals(self):
         all_jobs=[]
-        portals=[self.scrape_remotive,self.scrape_indeed,self.scrape_remoteok,
-                self.scrape_naukri,self.scrape_shine,self.scrape_timesjobs]
-        for fn in portals:
+        for scraper in [self.scrape_remotive, self.scrape_indeed]:
             try:
-                log(f"🔍 Scraping {fn.__name__}...")
-                jobs=fn()
+                jobs=scraper()
                 all_jobs.extend(jobs)
-                log(f"   ✓ Found {len(jobs)} matching jobs")
             except Exception as e:
-                log(f"   ✗ Error: {e}")
+                log(f"❌ Scraper exception: {e}")
             time.sleep(2)
         return all_jobs
 
-
-    # Optional Telegram
-    def send_telegram(self, job):
-        if not self.telegram_bot_token or not self.telegram_chat_id:
-            return
-        msg=f"New Job: {job['title']} at {job['company']} ({job['portal']})\nApply: {job['link']}"
-        url=f"https://api.telegram.org/bot{self.telegram_bot_token}/sendMessage"
-        try:
-            r=requests.post(url,json={'chat_id':self.telegram_chat_id,'text':msg,'disable_web_page_preview':False})
-            if r.status_code==200:
-                log(f"✅ Telegram sent: {job['title']}")
-            else:
-                log(f"❌ Telegram error: {r.status_code}")
-        except Exception as e:
-            log(f"❌ Telegram send fail: {e}")
-
-    # Process jobs
-    def run_scraper_cycle(self):
-        jobs=self.scrape_all()
+    def process_jobs(self):
+        jobs=self.scrape_all_portals()
+        jobs.sort(key=lambda x:x['days_ago'])
         new_count=0
         for job in jobs:
-            if not self.is_job_seen(job['id']):
-                self.mark_job_seen(job)
-                self.send_telegram(job)
+            job_id=self.generate_job_id(job['title'],job.get('company',''),job['link'])
+            if not self.is_job_seen(job_id):
+                if self.telegram_bot_token and self.telegram_chat_id:
+                    self.send_telegram(job)
+                self.mark_job_seen(job_id,job['title'],job.get('company',''),job['link'],job['portal'],job['posted_date'],job['days_ago'])
                 new_count+=1
-        log(f"📊 Summary: {len(jobs)} total, {new_count} new")
+        log(f"📊 Total jobs: {len(jobs)}, New: {new_count}")
+        return jobs
 
-    # Main loop
-    def run(self):
-        log("🤖 Job Scraper Bot Started")
-        while True:
-            try:
-                self.run_scraper_cycle()
-                time.sleep(self.check_interval)
-            except KeyboardInterrupt:
-                log("👋 Bot stopped by user")
-                break
-            except Exception as e:
-                log(f"❌ Main loop error: {e}")
-                time.sleep(60)
+    def send_telegram(self, job):
+        msg=f"New Job: {job['title']} at {job.get('company','N/A')} [{job['portal']}] {job['link']}"
+        url=f"https://api.telegram.org/bot{self.telegram_bot_token}/sendMessage"
+        payload={'chat_id':self.telegram_chat_id,'text':msg}
+        try:
+            r=requests.post(url,json=payload,timeout=10)
+            log(f"Telegram response: {r.status_code}")
+        except Exception as e:
+            log(f"❌ Telegram error: {e}")
 
-bot = JobScraperBot()
+# ---------------- Flask Dashboard ----------------
+app=Flask(__name__)
+bot=JobScraperBot()
 
-# ----------------------
-# Flask route
-# ----------------------
+# Simple auth
+def check_auth(username,password):
+    return username==bot.dash_user and password==bot.dash_pass
+
+def authenticate():
+    return Response('Login required', 401, {'WWW-Authenticate':'Basic realm="Login"'})
+
 @app.route("/")
-@auth.login_required
-def dashboard():
-    cursor = bot.conn.cursor()
-    cursor.execute("SELECT title,company,link,portal,posted_date,days_ago FROM jobs ORDER BY posted_date DESC")
-    rows = cursor.fetchall()
-    jobs = [{'title': r[0], 'company': r[1], 'link': r[2], 'portal': r[3],
-             'posted_date': r[4], 'days_ago': r[5]} for r in rows]
-    return render_template("index.html", jobs=jobs)
+def index():
+    auth=request.authorization
+    if not auth or not check_auth(auth.username,auth.password):
+        return authenticate()
+    jobs=bot.process_jobs()
+    return render_template('index.html',jobs=jobs)
 
-# ----------------------
-# Run Flask + Bot in Thread
-# ----------------------
-def start_bot():
-    bot.run()
-
-if __name__ == "__main__":
-    t = threading.Thread(target=start_bot)
-    t.start()
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT",8080)))
+if __name__=="__main__":
+    log("🤖 Job Scraper & Dashboard starting...")
+    app.run(host="0.0.0.0", port=int(os.getenv('PORT',8080)))
